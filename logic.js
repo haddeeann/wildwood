@@ -57,7 +57,6 @@ createApp({
     const selectedSlot = ref(null);
     const rotation = ref(0);
     const previewAnchor = ref(null);
-    const currentPlayer = ref(0);
     const round = ref(1);
     const showRules = ref(false);
     const showGameOver = ref(false);
@@ -67,11 +66,11 @@ createApp({
     const seasonNames = ['Spring', 'Summer', 'Autumn', 'Winter'];
     const season = computed(() => seasonNames[Math.min(3, Math.floor((round.value - 1) / 2))]);
     const edict = computed(() => EDICTS[Math.min(3, Math.floor((round.value - 1) / 2))]);
-    const turnLabel = computed(() => players.value[currentPlayer.value].name);
-    const activeBoard = computed(() => players.value[currentPlayer.value].board);
+    const activeBoard = computed(() => players.value[0].board);
     const selectedPiece = computed(() => selectedSlot.value === null ? null : shelf.value[selectedSlot.value]);
     const tilesLeft = computed(() => Math.max(0, 42 - history.value.reduce((n, h) => n + h.size, 0)));
-    const boardCells = computed(() => BOARD_COORDS.map(([q,r]) => ({ q, r, key: key(q,r), edge: EDGE_KEYS.has(key(q,r)), value: activeBoard.value[key(q,r)] || null })));
+    const playerBoardCells = computed(() => boardCellsFor(0));
+    const botBoardCells = computed(() => boardCellsFor(1));
     const orientedCells = computed(() => {
       if (!selectedPiece.value) return [];
       return selectedPiece.value.cells.map(([q,r,biome]) => {
@@ -92,13 +91,15 @@ createApp({
     });
 
     function selectPiece(index) {
-      selectedSlot.value = index; rotation.value = 0; previewAnchor.value = null;
-      toast.value = `${shelf.value[index].shape} selected. Choose an open hex to place it.`;
+      selectedSlot.value = index; rotation.value = 0;
+      snapPreview();
+      toast.value = previewAnchor.value ? `${shelf.value[index].shape} snapped into place. Move it or confirm.` : 'No open space fits this clump.';
     }
     function rotatePiece() {
       if (!selectedPiece.value) return;
-      rotation.value = (rotation.value + 1) % 6; previewAnchor.value = null;
-      toast.value = 'Clump rotated 60°. Chirality preserved.';
+      rotation.value = (rotation.value + 1) % 6;
+      snapPreview();
+      toast.value = previewAnchor.value ? 'Clump rotated and snapped to the nearest valid space.' : 'That orientation has no valid space.';
     }
     function cellClick(cell) {
       if (!selectedPiece.value || cell.value) return;
@@ -112,35 +113,72 @@ createApp({
     }
     function confirmPlacement() {
       if (!isValidPreview.value) return;
-      const player = players.value[currentPlayer.value];
-      const [aq, ar] = previewAnchor.value;
       const piece = selectedPiece.value;
-      const wildlifeBiome = piece.wildlife ? WILDLIFE[piece.wildlife].biome : null;
-      let tokenPlaced = false;
-      orientedCells.value.forEach(([q,r,biome]) => {
-        player.board[key(aq+q, ar+r)] = { biome, wildlife: !tokenPlaced && biome === wildlifeBiome ? piece.wildlife : null };
-        if (!tokenPlaced && biome === wildlifeBiome) tokenPlaced = true;
-      });
-      history.value.push({ player: currentPlayer.value, size: orientedCells.value.length });
+      placePiece(0, piece, orientedCells.value, previewAnchor.value);
+      history.value.push({ player: 0, size: orientedCells.value.length });
       refillShelf(selectedSlot.value);
       selectedSlot.value = null; previewAnchor.value = null; rotation.value = 0;
       updateScores();
-      if (Object.keys(player.board).length === BOARD_COORDS.length) return endGame();
-      advanceTurn();
+      if (Object.keys(players.value[0].board).length === BOARD_COORDS.length) return endGame();
+      botTurn();
     }
     function refillShelf(slot) {
       shelf.value[slot] = clonePiece(PIECES[bagIndex.value % PIECES.length], bagIndex.value);
       bagIndex.value++;
     }
-    function advanceTurn() {
-      if (currentPlayer.value === 0) currentPlayer.value = 1;
-      else {
-        currentPlayer.value = 0;
-        if (round.value % 2 === 0) scoreSeason(Math.floor((round.value - 1) / 2));
-        if (round.value === 8) return endGame();
-        round.value++;
+    function boardCellsFor(playerIndex) {
+      const board = players.value[playerIndex].board;
+      return BOARD_COORDS.map(([q,r]) => ({ q, r, key: key(q,r), edge: EDGE_KEYS.has(key(q,r)), value: board[key(q,r)] || null }));
+    }
+    function validAt(board, cells, anchor) {
+      const [aq, ar] = anchor;
+      return cells.every(([q,r]) => BOARD_KEYS.has(key(aq+q, ar+r)) && !board[key(aq+q, ar+r)]);
+    }
+    function snapPreview() {
+      previewAnchor.value = BOARD_COORDS
+        .filter(anchor => validAt(activeBoard.value, orientedCells.value, anchor))
+        .sort(([aq,ar],[bq,br]) => ((aq-1.25)**2+(ar-2)**2) - ((bq-1.25)**2+(br-2)**2))[0] || null;
+    }
+    function placePiece(playerIndex, piece, cells, anchor) {
+      const board = players.value[playerIndex].board;
+      const [aq, ar] = anchor;
+      const wildlifeBiome = piece.wildlife ? WILDLIFE[piece.wildlife].biome : null;
+      let tokenPlaced = false;
+      cells.forEach(([q,r,biome]) => {
+        board[key(aq+q, ar+r)] = { biome, wildlife: !tokenPlaced && biome === wildlifeBiome ? piece.wildlife : null };
+        if (!tokenPlaced && biome === wildlifeBiome) tokenPlaced = true;
+      });
+    }
+    function botTurn() {
+      const board = players.value[1].board;
+      let choice = null;
+      shelf.value.forEach((piece, slot) => {
+        for (let turn = 0; turn < 6; turn++) {
+          const cells = piece.cells.map(([q,r,biome]) => {
+            let coord = [q,r]; for (let i=0; i<turn; i++) coord = rotateCoord(coord);
+            return [...coord, biome];
+          });
+          BOARD_COORDS.forEach(anchor => {
+            if (!validAt(board, cells, anchor)) return;
+            const testBoard = { ...board };
+            const [aq,ar] = anchor;
+            cells.forEach(([q,r,biome]) => { testBoard[key(aq+q,ar+r)] = { biome, wildlife: null }; });
+            const value = groveScore(testBoard) + cells.length;
+            if (!choice || value > choice.value) choice = { piece, slot, cells, anchor, value };
+          });
+        }
+      });
+      if (choice) {
+        placePiece(1, choice.piece, choice.cells, choice.anchor);
+        history.value.push({ player: 1, size: choice.cells.length });
+        refillShelf(choice.slot);
       }
-      toast.value = `${turnLabel.value}'s turn — choose a clump.`;
+      updateScores();
+      if (Object.keys(players.value[1].board).length === BOARD_COORDS.length) return endGame();
+      if (round.value % 2 === 0) scoreSeason(Math.floor((round.value - 1) / 2));
+      if (round.value === 8) return endGame();
+      round.value++;
+      toast.value = 'Your turn — choose a clump. Lyra has finished her move.';
     }
     function biomeClusters(board, biome) {
       const candidates = new Set(Object.entries(board).filter(([,v]) => v.biome === biome).map(([k]) => k));
@@ -220,17 +258,17 @@ createApp({
       players.value.forEach(p => { if (Math.max(0, ...biomeClusters(p.board, goal.biome)) >= goal.target) p.edicts += 8; });
       updateScores();
     }
-    function largestCluster(biome) { return Math.max(0, ...biomeClusters(activeBoard.value, biome)); }
+    function largestCluster(biome, playerIndex = 0) { return Math.max(0, ...biomeClusters(players.value[playerIndex].board, biome)); }
     const wildlifeRows = computed(() => Object.entries(WILDLIFE).map(([type, data]) => ({ type, ...data, ...wildlifeProgress(activeBoard.value, type) })));
     const edictProgress = computed(() => Math.min(edict.value.target, Math.max(0, ...biomeClusters(activeBoard.value, edict.value.biome))));
     function endGame() { updateScores(); showGameOver.value = true; toast.value = 'The sanctuary is complete.'; }
     function resetGame() {
       players.value.forEach(p => { p.board = {}; p.score = 0; p.edicts = 0; });
       shelf.value = PIECES.slice(0,4).map((p,i) => clonePiece(p,i)); bagIndex.value = 4;
-      currentPlayer.value = 0; round.value = 1; selectedSlot.value = null; previewAnchor.value = null; history.value = [];
+      round.value = 1; selectedSlot.value = null; previewAnchor.value = null; history.value = [];
       showGameOver.value = false; toast.value = 'Choose a clump from the Canopy Draft Shelf.';
     }
-    return { BIOMES, WILDLIFE, players, shelf, selectedSlot, selectedPiece, currentPlayer, round, season, edict, boardCells,
+    return { BIOMES, WILDLIFE, players, shelf, selectedSlot, selectedPiece, round, season, edict, playerBoardCells, botBoardCells,
       previewKeys, isValidPreview, showRules, showGameOver, toast, tilesLeft, wildlifeRows, edictProgress,
       selectPiece, rotatePiece, cellClick, previewBiome, confirmPlacement, largestCluster, resetGame };
   },
@@ -241,7 +279,7 @@ createApp({
         <nav class="season-track" aria-label="Season progress">
           <div v-for="(name, i) in ['Spring','Summer','Autumn','Winter']" :class="['season-step', {active: season === name, passed: Math.floor((round-1)/2) > i}]"><span>{{ ['✿','☀','❦','❄'][i] }}</span><small>{{ name }}</small></div>
         </nav>
-        <div class="top-actions"><div class="round-pill"><span>Round</span><strong>{{ round }}</strong><span>/ 8</span></div><button class="soft-button" @click="showRules = true">? <span>How to play</span></button></div>
+        <div class="top-actions"><p class="win-note">Highest score after Round 8 wins.</p><div class="round-pill"><span>Round</span><strong>{{ round }}</strong><span>/ 8</span></div><button class="soft-button" @click="showRules = true">? <span>How to play</span></button></div>
       </header>
 
       <main class="tabletop">
@@ -257,22 +295,36 @@ createApp({
         </section>
 
         <section class="play-area">
-          <div class="board-panel panel">
-            <div class="section-heading board-heading"><div><span class="eyebrow">{{ players[currentPlayer].name }}'s sanctuary</span><h2>Whispering Vale Peninsula</h2></div><div class="player-switcher"><div v-for="(player, i) in players" :class="['player-chip', {active: i === currentPlayer}]"><span class="avatar">{{ player.initials }}</span><div><small>{{ player.name }}</small><strong>{{ player.score }} pts</strong></div></div></div></div>
-            <div class="board-wrap"><div class="river-edge-label">⌁ Northern river edge</div><div class="hex-board" aria-label="Sanctuary board">
-              <button v-for="cell in boardCells" :key="cell.key" :class="['hex', cell.value?.biome || 'empty', {edge: cell.edge, preview: previewKeys.has(cell.key), invalid: previewKeys.has(cell.key) && !isValidPreview}]" :style="{ '--q': cell.q, '--r': cell.r }" @click="cellClick(cell)">
-                <span class="habitat-icon">{{ cell.value ? BIOMES[cell.value.biome].icon : (previewBiome(cell) ? BIOMES[previewBiome(cell)].icon : '+') }}</span><span v-if="cell.value?.wildlife" class="token">{{ WILDLIFE[cell.value.wildlife].icon }}</span>
-              </button>
-            </div></div>
-            <div class="board-footer"><div class="legend"><span v-for="(bio,key) in BIOMES"><i :class="key"></i>{{ bio.label }} <b>{{ largestCluster(key) }}</b></span></div><div class="turn-hint"><i></i>{{ toast }}</div></div>
+          <div class="boards-pair">
+            <article class="board-panel player-board panel">
+              <div class="section-heading board-heading"><div><span class="eyebrow">Your sanctuary</span><h2>Whispering Vale Peninsula</h2></div><div class="player-chip active"><span class="avatar">{{ players[0].initials }}</span><div><small>{{ players[0].name }}</small><strong>{{ players[0].score }} pts</strong></div></div></div>
+              <div class="board-wrap"><div class="river-edge-label">⌁ Northern river edge</div><div class="hex-board" aria-label="Your Whispering Vale Peninsula">
+                <button v-for="cell in playerBoardCells" :key="cell.key" :class="['hex', cell.value?.biome || previewBiome(cell) || 'empty', {edge: cell.edge, preview: previewKeys.has(cell.key), invalid: previewKeys.has(cell.key) && !isValidPreview}]" :style="{ '--q': cell.q, '--r': cell.r }" @click="cellClick(cell)">
+                  <span class="habitat-icon">{{ cell.value ? BIOMES[cell.value.biome].icon : (previewBiome(cell) ? BIOMES[previewBiome(cell)].icon : '+') }}</span><span v-if="cell.value?.wildlife" class="token">{{ WILDLIFE[cell.value.wildlife].icon }}</span>
+                </button>
+              </div></div>
+              <div class="board-footer"><div class="legend"><span v-for="(bio,key) in BIOMES"><i :class="key"></i>{{ bio.label }} <b>{{ largestCluster(key, 0) }}</b></span></div><div class="turn-hint"><i></i>{{ toast }}</div></div>
+              <div class="board-actions"><button class="confirm-button" :disabled="!isValidPreview" @click="confirmPlacement"><span>✓</span> Confirm & place clump</button><p class="confirm-help" v-if="!selectedPiece">Select a shelf clump to see its placement</p><p class="confirm-help" v-else-if="!isValidPreview">Choose another position or rotation</p></div>
+            </article>
+
+            <article class="board-panel opponent-board panel">
+              <div class="section-heading board-heading"><div><span class="eyebrow">Bot sanctuary</span><h2>Lyra's Mosslight Reach</h2></div><div class="player-chip active"><span class="avatar">{{ players[1].initials }}</span><div><small>{{ players[1].name }} · Bot</small><strong>{{ players[1].score }} pts</strong></div></div></div>
+              <div class="board-wrap"><div class="river-edge-label">Northern river edge ⌁</div><div class="hex-board" aria-label="Lyra's sanctuary">
+                <div v-for="cell in botBoardCells" :key="cell.key" :class="['hex', cell.value?.biome || 'empty', {edge: cell.edge}]" :style="{ '--q': cell.q, '--r': cell.r }">
+                  <span class="habitat-icon">{{ cell.value ? BIOMES[cell.value.biome].icon : '+' }}</span><span v-if="cell.value?.wildlife" class="token">{{ WILDLIFE[cell.value.wildlife].icon }}</span>
+                </div>
+              </div></div>
+              <div class="board-footer"><div class="legend"><span v-for="(bio,key) in BIOMES"><i :class="key"></i>{{ bio.label }} <b>{{ largestCluster(key, 1) }}</b></span></div><div class="bot-status"><i></i>Updates automatically after your move</div></div>
+            </article>
           </div>
 
+          <p class="end-note">Game ends at Round 8, or sooner if a board fills completely — score is what matters, not filling it.</p>
+
           <aside class="ledger panel"><div class="ledger-tab"></div>
-            <div class="ledger-heading"><div><span class="eyebrow">Live score</span><h2>Wildwood Ledger</h2></div><div class="score-total"><strong>{{ players[currentPlayer].score }}</strong><span>pts</span></div></div>
-            <div class="score-breakdown"><div><small>Grove bonus</small><strong>+{{ ['forest','meadow','river','wetland'].reduce((s,b) => s + ([0,1,3,6,10,15,21][Math.min(largestCluster(b),6)]), 0) }}</strong></div><div><small>Wildlife</small><strong>+{{ wildlifeRows.reduce((s,w) => s+w.score, 0) }}</strong></div><div><small>Edicts</small><strong>+{{ players[currentPlayer].edicts }}</strong></div></div>
-            <h3>Wildlife tokens</h3><div class="wildlife-list"><div v-for="item in wildlifeRows" class="wildlife-row"><span :class="['animal-icon', item.type]">{{ item.icon }}</span><div><strong>{{ item.name }}</strong><small>{{ item.detail }}</small></div><div class="wild-score"><b>+{{ item.score }}</b><small>{{ item.text }}</small></div></div></div>
-            <div class="edict-card"><div class="edict-art">{{ edict.icon }}</div><div><span>Seasonal edict · {{ season }}</span><h3>{{ edict.name }}</h3><p>{{ edict.copy }}</p><div class="progress"><i :style="{width: (edictProgress/edict.target*100)+'%'}"></i></div><small>{{ edictProgress }} / {{ edict.target }} connected</small></div><b>+8</b></div>
-            <button class="confirm-button" :disabled="!isValidPreview" @click="confirmPlacement"><span>✓</span> Confirm & place clump</button><p class="confirm-help" v-if="!selectedPiece">Select a shelf clump to begin</p><p class="confirm-help" v-else-if="!isValidPreview">Choose a valid board position</p>
+            <div class="ledger-heading"><div><span class="eyebrow">Your live score</span><h2>Wildwood Ledger</h2></div><div class="score-total"><strong>{{ players[0].score }}</strong><span>pts</span></div></div>
+            <div class="score-breakdown"><div><small>Biggest habitat patch</small><strong>+{{ ['forest','meadow','river','wetland'].reduce((s,b) => s + ([0,1,3,6,10,15,21][Math.min(largestCluster(b,0),6)]), 0) }}</strong><p>Only your largest connected patch of each habitat scores.</p></div><div><small>Animal bonuses</small><strong>+{{ wildlifeRows.reduce((s,w) => s+w.score, 0) }}</strong><p>Drafted animals reward specific habitat patterns.</p></div><div><small>Season goal</small><strong>+{{ players[0].edicts }}</strong><p>Complete the current two-round goal for eight points.</p></div></div>
+            <div class="ledger-details"><div><h3>Wildlife tokens</h3><div class="wildlife-list"><div v-for="item in wildlifeRows" class="wildlife-row"><span :class="['animal-icon', item.type]">{{ item.icon }}</span><div><strong>{{ item.name }}</strong><small>{{ item.detail }}</small></div><div class="wild-score"><b>+{{ item.score }}</b><small>{{ item.text }}</small></div></div></div></div>
+            <div class="edict-card"><div class="edict-art">{{ edict.icon }}</div><div><span>Seasonal edict · {{ season }}</span><h3>{{ edict.name }}</h3><p>{{ edict.copy }}</p><div class="progress"><i :style="{width: (edictProgress/edict.target*100)+'%'}"></i></div><small>{{ edictProgress }} / {{ edict.target }} connected</small></div><b>+8</b></div></div>
           </aside>
         </section>
 
